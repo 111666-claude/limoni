@@ -48,9 +48,13 @@ type gltfScene struct {
 }
 
 type gltfNode struct {
-	Name     string `json:"name,omitempty"`
-	Mesh     *int   `json:"mesh,omitempty"`
-	Children []int  `json:"children,omitempty"`
+	Name        string    `json:"name,omitempty"`
+	Mesh        *int      `json:"mesh,omitempty"`
+	Children    []int     `json:"children,omitempty"`
+	Matrix      []float64 `json:"matrix,omitempty"`      // column-major 4×4, the whole local transform
+	Translation []float64 `json:"translation,omitempty"` // T of a TRS transform
+	Rotation    []float64 `json:"rotation,omitempty"`    // quaternion x, y, z, w
+	Scale       []float64 `json:"scale,omitempty"`       // S of a TRS transform
 }
 
 type gltfMesh struct {
@@ -314,201 +318,365 @@ func buildModelFromGLTF(doc *gltfJSON, buffers [][]byte, sourcePath string) (Mod
 		}
 	}
 
-	for _, mesh := range doc.Meshes {
-		for _, prim := range mesh.Primitives {
-			posAccIdx, hasPos := prim.Attributes["POSITION"]
-			if !hasPos {
-				continue
-			}
+	// Each primitive is decoded once; a mesh mounted at several nodes is
+	// decoded once and instanced at each node's composed transform.
+	type gltfTriangle struct {
+		i0, i1, i2 int
+		color      cell.Color
+		hasUV      bool
+	}
+	type primitiveGeometry struct {
+		positions []Vertex3D
+		normals   []Vector3D
+		uvs       []UV
+		triangles []gltfTriangle
+	}
+	type primitiveKey struct{ mesh, prim int }
+	decoded := make(map[primitiveKey]*primitiveGeometry)
 
-			posBytes, posAcc, posStride, err := getAccessorBytes(posAccIdx)
-			if err != nil {
-				return Model3D{}, err
-			}
+	decodePrimitive := func(meshIdx, primIdx int) (*primitiveGeometry, error) {
+		key := primitiveKey{meshIdx, primIdx}
+		if g, ok := decoded[key]; ok {
+			return g, nil
+		}
+		mesh := doc.Meshes[meshIdx]
+		prim := mesh.Primitives[primIdx]
 
-			vertexOffset := len(model.Vertices)
-			elemSize := 12 // 3 * float32
-			if posStride < elemSize {
-				posStride = elemSize
-			}
+		posAccIdx, hasPos := prim.Attributes["POSITION"]
+		if !hasPos {
+			decoded[key] = nil
+			return nil, nil
+		}
 
-			for i := 0; i < posAcc.Count; i++ {
-				offset := i * posStride
-				if offset+12 > len(posBytes) {
-					break
+		posBytes, posAcc, posStride, err := getAccessorBytes(posAccIdx)
+		if err != nil {
+			return nil, err
+		}
+
+		elemSize := 12 // 3 * float32
+		if posStride < elemSize {
+			posStride = elemSize
+		}
+		positions := make([]Vertex3D, 0, posAcc.Count)
+		for i := 0; i < posAcc.Count; i++ {
+			offset := i * posStride
+			if offset+12 > len(posBytes) {
+				break
+			}
+			x := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset:]))
+			y := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset+4:]))
+			z := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset+8:]))
+			v := Vertex3D{X: float64(x), Y: float64(y), Z: float64(z)}
+			if !finiteVertex(v) {
+				return nil, fmt.Errorf("mesh %d primitive %d: position %d is not finite", meshIdx, primIdx, i)
+			}
+			positions = append(positions, v)
+		}
+		if len(positions) == 0 {
+			decoded[key] = nil
+			return nil, nil
+		}
+
+		// NORMAL is optional. A primitive that carries one usable unit
+		// normal per vertex feeds those normals through; anything else
+		// leaves them nil so the renderer derives them from the faces, as
+		// it does for the other formats.
+		var normals []Vector3D
+		if normalAccIdx, hasNormal := prim.Attributes["NORMAL"]; hasNormal {
+			if normalBytes, normalAcc, normalStride, err := getAccessorBytes(normalAccIdx); err == nil {
+				if normalStride < elemSize {
+					normalStride = elemSize
 				}
-				x := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset:]))
-				y := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset+4:]))
-				z := math.Float32frombits(binary.LittleEndian.Uint32(posBytes[offset+8:]))
-				model.Vertices = append(model.Vertices, Vertex3D{
-					X: float64(x),
-					Y: float64(y),
-					Z: float64(z),
-				})
-			}
-
-			// UV Coordinates (TEXCOORD_0)
-			var uvs []uvCoord
-			if uvAccIdx, hasUV := prim.Attributes["TEXCOORD_0"]; hasUV {
-				if uvBytes, uvAcc, uvStride, err := getAccessorBytes(uvAccIdx); err == nil {
-					uvElemSize := 8 // 2 * float32
-					if uvStride < uvElemSize {
-						uvStride = uvElemSize
-					}
-					for i := 0; i < uvAcc.Count; i++ {
-						offset := i * uvStride
-						if offset+8 > len(uvBytes) {
+				if normalAcc.Count >= len(positions) {
+					normals = make([]Vector3D, 0, len(positions))
+					for i := 0; i < len(positions); i++ {
+						offset := i * normalStride
+						if offset+12 > len(normalBytes) {
+							normals = nil
 							break
 						}
-						u := math.Float32frombits(binary.LittleEndian.Uint32(uvBytes[offset:]))
-						v := math.Float32frombits(binary.LittleEndian.Uint32(uvBytes[offset+4:]))
-						uvs = append(uvs, uvCoord{u: float64(u), v: float64(v)})
-					}
-				}
-			}
-
-			// Material and Texture resolution
-			var primImage image.Image
-			var baseColor cell.Color
-
-			if prim.Material != nil && *prim.Material >= 0 && *prim.Material < len(doc.Materials) {
-				matDef := doc.Materials[*prim.Material]
-				if matDef.PbrMetallicRoughness != nil {
-					pbr := matDef.PbrMetallicRoughness
-					if pbr.BaseColorTexture != nil {
-						texIdx := pbr.BaseColorTexture.Index
-						if texIdx >= 0 && texIdx < len(doc.Textures) {
-							texDef := doc.Textures[texIdx]
-							if texDef.Source != nil && *texDef.Source >= 0 && *texDef.Source < len(decodedImages) {
-								primImage = decodedImages[*texDef.Source]
-							}
+						n := Vector3D{
+							X: float64(math.Float32frombits(binary.LittleEndian.Uint32(normalBytes[offset:]))),
+							Y: float64(math.Float32frombits(binary.LittleEndian.Uint32(normalBytes[offset+4:]))),
+							Z: float64(math.Float32frombits(binary.LittleEndian.Uint32(normalBytes[offset+8:]))),
 						}
-					}
-					if len(pbr.BaseColorFactor) >= 3 {
-						r := uint8(pbr.BaseColorFactor[0] * 255.0)
-						g := uint8(pbr.BaseColorFactor[1] * 255.0)
-						b := uint8(pbr.BaseColorFactor[2] * 255.0)
-						baseColor = cell.NewColorRGB(r, g, b)
+						length := math.Sqrt(n.X*n.X + n.Y*n.Y + n.Z*n.Z)
+						if !finiteVector(n) || length < 1e-9 {
+							normals = nil
+							break
+						}
+						normals = append(normals, Vector3D{X: n.X / length, Y: n.Y / length, Z: n.Z / length})
 					}
 				}
 			}
+		}
 
-			if model.Texture == nil && primImage != nil {
-				model.Texture = primImage
-			}
-
-			uvOffset := len(model.UVs)
-			for _, uv := range uvs {
-				model.UVs = append(model.UVs, UV{U: uv.u, V: uv.v})
-			}
-
-			sampleTextureColor := func(u, v float64) cell.Color {
-				if primImage == nil {
-					if baseColor != 0 {
-						return baseColor
-					}
-					return 0
+		// UV Coordinates (TEXCOORD_0)
+		var uvs []UV
+		if uvAccIdx, hasUV := prim.Attributes["TEXCOORD_0"]; hasUV {
+			if uvBytes, uvAcc, uvStride, err := getAccessorBytes(uvAccIdx); err == nil {
+				uvElemSize := 8 // 2 * float32
+				if uvStride < uvElemSize {
+					uvStride = uvElemSize
 				}
-				bounds := primImage.Bounds()
-				bw := bounds.Dx()
-				bh := bounds.Dy()
-				if bw <= 0 || bh <= 0 {
-					return baseColor
-				}
-
-				// Wrap / clamp UV coordinates
-				u = u - math.Floor(u)
-				v = v - math.Floor(v)
-
-				px := bounds.Min.X + int(u*float64(bw-1))
-				py := bounds.Min.Y + int(v*float64(bh-1))
-
-				r, g, b, _ := primImage.At(px, py).RGBA()
-				return cell.NewColorRGB(uint8(r>>8), uint8(g>>8), uint8(b>>8))
-			}
-
-			// Indices / Faces
-			if prim.Indices != nil {
-				idxBytes, idxAcc, _, err := getAccessorBytes(*prim.Indices)
-				if err != nil {
-					return Model3D{}, err
-				}
-
-				indices := make([]int, 0, idxAcc.Count)
-				switch idxAcc.ComponentType {
-				case compTypeUnsignedByte:
-					for i := 0; i < idxAcc.Count && i < len(idxBytes); i++ {
-						indices = append(indices, int(idxBytes[i]))
-					}
-				case compTypeUnsignedShort:
-					for i := 0; i < idxAcc.Count && (i+1)*2 <= len(idxBytes); i++ {
-						indices = append(indices, int(binary.LittleEndian.Uint16(idxBytes[i*2:])))
-					}
-				case compTypeUnsignedInt:
-					for i := 0; i < idxAcc.Count && (i+1)*4 <= len(idxBytes); i++ {
-						indices = append(indices, int(binary.LittleEndian.Uint32(idxBytes[i*4:])))
-					}
-				}
-
-				for i := 0; i+2 < len(indices); i += 3 {
-					i0, i1, i2 := indices[i], indices[i+1], indices[i+2]
-					if i0 < 0 || i1 < 0 || i2 < 0 ||
-						vertexOffset+i0 >= len(model.Vertices) ||
-						vertexOffset+i1 >= len(model.Vertices) ||
-						vertexOffset+i2 >= len(model.Vertices) {
-						continue
-					}
-
-					model.Faces = append(model.Faces, []int{
-						vertexOffset + i0,
-						vertexOffset + i1,
-						vertexOffset + i2,
-					})
-
-					// Sample texture color for this triangle
-					if len(uvs) > i0 && len(uvs) > i1 && len(uvs) > i2 {
-						avgU := (uvs[i0].u + uvs[i1].u + uvs[i2].u) / 3.0
-						avgV := (uvs[i0].v + uvs[i1].v + uvs[i2].v) / 3.0
-						model.FaceColors = append(model.FaceColors, sampleTextureColor(avgU, avgV))
-						model.FaceUVs = append(model.FaceUVs, []int{
-							uvOffset + i0,
-							uvOffset + i1,
-							uvOffset + i2,
-						})
-					} else {
-						model.FaceColors = append(model.FaceColors, baseColor)
-						model.FaceUVs = append(model.FaceUVs, []int{-1, -1, -1})
-					}
-				}
-			} else {
-				// Non-indexed triangles
-				added := len(model.Vertices) - vertexOffset
-				for i := 0; i+2 < added; i += 3 {
-					if vertexOffset+i+2 >= len(model.Vertices) {
+				for i := 0; i < uvAcc.Count; i++ {
+					offset := i * uvStride
+					if offset+8 > len(uvBytes) {
 						break
 					}
-
-					model.Faces = append(model.Faces, []int{
-						vertexOffset + i,
-						vertexOffset + i + 1,
-						vertexOffset + i + 2,
-					})
-
-					if len(uvs) > i+2 {
-						avgU := (uvs[i].u + uvs[i+1].u + uvs[i+2].u) / 3.0
-						avgV := (uvs[i].v + uvs[i+1].v + uvs[i+2].v) / 3.0
-						model.FaceColors = append(model.FaceColors, sampleTextureColor(avgU, avgV))
-						model.FaceUVs = append(model.FaceUVs, []int{
-							uvOffset + i,
-							uvOffset + i + 1,
-							uvOffset + i + 2,
-						})
-					} else {
-						model.FaceColors = append(model.FaceColors, baseColor)
-						model.FaceUVs = append(model.FaceUVs, []int{-1, -1, -1})
-					}
+					u := math.Float32frombits(binary.LittleEndian.Uint32(uvBytes[offset:]))
+					v := math.Float32frombits(binary.LittleEndian.Uint32(uvBytes[offset+4:]))
+					uvs = append(uvs, UV{U: float64(u), V: float64(v)})
 				}
 			}
+		}
+
+		// Material and Texture resolution
+		var primImage image.Image
+		var baseColor cell.Color
+
+		if prim.Material != nil && *prim.Material >= 0 && *prim.Material < len(doc.Materials) {
+			matDef := doc.Materials[*prim.Material]
+			if matDef.PbrMetallicRoughness != nil {
+				pbr := matDef.PbrMetallicRoughness
+				if pbr.BaseColorTexture != nil {
+					texIdx := pbr.BaseColorTexture.Index
+					if texIdx >= 0 && texIdx < len(doc.Textures) {
+						texDef := doc.Textures[texIdx]
+						if texDef.Source != nil && *texDef.Source >= 0 && *texDef.Source < len(decodedImages) {
+							primImage = decodedImages[*texDef.Source]
+						}
+					}
+				}
+				if len(pbr.BaseColorFactor) >= 3 {
+					r := uint8(pbr.BaseColorFactor[0] * 255.0)
+					g := uint8(pbr.BaseColorFactor[1] * 255.0)
+					b := uint8(pbr.BaseColorFactor[2] * 255.0)
+					baseColor = cell.NewColorRGB(r, g, b)
+				}
+			}
+		}
+
+		sampleTextureColor := func(u, v float64) cell.Color {
+			if primImage == nil {
+				if baseColor != 0 {
+					return baseColor
+				}
+				return 0
+			}
+			bounds := primImage.Bounds()
+			bw := bounds.Dx()
+			bh := bounds.Dy()
+			if bw <= 0 || bh <= 0 {
+				return baseColor
+			}
+
+			// Wrap / clamp UV coordinates
+			u = u - math.Floor(u)
+			v = v - math.Floor(v)
+
+			px := bounds.Min.X + int(u*float64(bw-1))
+			py := bounds.Min.Y + int(v*float64(bh-1))
+
+			r, g, b, _ := primImage.At(px, py).RGBA()
+			return cell.NewColorRGB(uint8(r>>8), uint8(g>>8), uint8(b>>8))
+		}
+
+		g := &primitiveGeometry{positions: positions, normals: normals, uvs: uvs}
+		if primImage != nil && model.Texture == nil {
+			model.Texture = primImage
+		}
+
+		addTriangle := func(i0, i1, i2 int) {
+			color := baseColor
+			hasUV := false
+			if len(uvs) > i0 && len(uvs) > i1 && len(uvs) > i2 {
+				avgU := (uvs[i0].U + uvs[i1].U + uvs[i2].U) / 3.0
+				avgV := (uvs[i0].V + uvs[i1].V + uvs[i2].V) / 3.0
+				color = sampleTextureColor(avgU, avgV)
+				hasUV = true
+			}
+			g.triangles = append(g.triangles, gltfTriangle{i0: i0, i1: i1, i2: i2, color: color, hasUV: hasUV})
+		}
+
+		// Indices / Faces
+		if prim.Indices != nil {
+			idxBytes, idxAcc, _, err := getAccessorBytes(*prim.Indices)
+			if err != nil {
+				return nil, err
+			}
+
+			indices := make([]int, 0, idxAcc.Count)
+			switch idxAcc.ComponentType {
+			case compTypeUnsignedByte:
+				for i := 0; i < idxAcc.Count && i < len(idxBytes); i++ {
+					indices = append(indices, int(idxBytes[i]))
+				}
+			case compTypeUnsignedShort:
+				for i := 0; i < idxAcc.Count && (i+1)*2 <= len(idxBytes); i++ {
+					indices = append(indices, int(binary.LittleEndian.Uint16(idxBytes[i*2:])))
+				}
+			case compTypeUnsignedInt:
+				for i := 0; i < idxAcc.Count && (i+1)*4 <= len(idxBytes); i++ {
+					indices = append(indices, int(binary.LittleEndian.Uint32(idxBytes[i*4:])))
+				}
+			}
+
+			for i := 0; i+2 < len(indices); i += 3 {
+				i0, i1, i2 := indices[i], indices[i+1], indices[i+2]
+				if i0 < 0 || i1 < 0 || i2 < 0 ||
+					i0 >= len(positions) || i1 >= len(positions) || i2 >= len(positions) {
+					continue
+				}
+				addTriangle(i0, i1, i2)
+			}
+		} else {
+			// Non-indexed triangles
+			for i := 0; i+2 < len(positions); i += 3 {
+				addTriangle(i, i+1, i+2)
+			}
+		}
+
+		decoded[key] = g
+		return g, nil
+	}
+
+	appendInstance := func(g *primitiveGeometry, world gltfMat4) error {
+		normalMatrix, err := world.normalMatrix()
+		if err != nil {
+			return err
+		}
+		vertexOffset := len(model.Vertices)
+		uvOffset := len(model.UVs)
+		mirrored := world.determinant() < 0
+
+		for _, p := range g.positions {
+			v := world.transformPoint(p)
+			if !finiteVertex(v) {
+				return fmt.Errorf("composed transform produced a non-finite vertex")
+			}
+			model.Vertices = append(model.Vertices, v)
+		}
+
+		if g.normals != nil {
+			for _, n := range g.normals {
+				t := normalMatrix.transform(n)
+				if !finiteVector(t) {
+					return fmt.Errorf("composed transform produced a non-finite normal")
+				}
+				model.VertexNormals = append(model.VertexNormals, t)
+			}
+		} else {
+			// Keep the slice aligned with Vertices; it is dropped below
+			// unless every instance carried normals.
+			model.VertexNormals = append(model.VertexNormals, make([]Vector3D, len(g.positions))...)
+		}
+
+		for _, uv := range g.uvs {
+			model.UVs = append(model.UVs, uv)
+		}
+
+		for _, tri := range g.triangles {
+			i0, i1, i2 := vertexOffset+tri.i0, vertexOffset+tri.i1, vertexOffset+tri.i2
+			u0, u1, u2 := uvOffset+tri.i0, uvOffset+tri.i1, uvOffset+tri.i2
+			if mirrored {
+				// A mirroring transform reverses the triangle's winding;
+				// swap two corners so front faces stay front faces. The face
+				// UVs are in corner order, so they swap with them.
+				i1, i2 = i2, i1
+				u1, u2 = u2, u1
+			}
+			model.Faces = append(model.Faces, []int{i0, i1, i2})
+			model.FaceColors = append(model.FaceColors, tri.color)
+			if tri.hasUV {
+				model.FaceUVs = append(model.FaceUVs, []int{u0, u1, u2})
+			} else {
+				model.FaceUVs = append(model.FaceUVs, []int{-1, -1, -1})
+			}
+		}
+		return nil
+	}
+
+	appendMesh := func(meshIdx int, world gltfMat4) error {
+		if meshIdx < 0 || meshIdx >= len(doc.Meshes) {
+			return fmt.Errorf("mesh index %d out of range (%d meshes)", meshIdx, len(doc.Meshes))
+		}
+		for primIdx := range doc.Meshes[meshIdx].Primitives {
+			g, err := decodePrimitive(meshIdx, primIdx)
+			if err != nil {
+				return err
+			}
+			if g == nil {
+				continue
+			}
+			if err := appendInstance(g, world); err != nil {
+				return fmt.Errorf("mesh %d primitive %d: %w", meshIdx, primIdx, err)
+			}
+		}
+		return nil
+	}
+
+	if len(doc.Nodes) == 0 {
+		// No scene graph at all: every mesh sits at the origin, exactly as
+		// before node transforms were supported.
+		for meshIdx := range doc.Meshes {
+			if err := appendMesh(meshIdx, gltfIdentity); err != nil {
+				return Model3D{}, err
+			}
+		}
+	} else {
+		if err := validateGLTFNodeGraph(doc); err != nil {
+			return Model3D{}, err
+		}
+		roots, err := gltfSceneRoots(doc)
+		if err != nil {
+			return Model3D{}, err
+		}
+		var walk func(nodeIdx, depth int, parent gltfMat4) error
+		walk = func(nodeIdx, depth int, parent gltfMat4) error {
+			if depth > maxGLTFNodeDepth {
+				return fmt.Errorf("node hierarchy is deeper than %d nodes", maxGLTFNodeDepth)
+			}
+			node := doc.Nodes[nodeIdx]
+			local, err := gltfNodeTransform(node)
+			if err != nil {
+				return fmt.Errorf("node %d %q: %w", nodeIdx, node.Name, err)
+			}
+			world := parent.mul(local)
+			if !world.isFinite() {
+				return fmt.Errorf("node %d %q: composed transform is not finite", nodeIdx, node.Name)
+			}
+			if node.Mesh != nil {
+				if err := appendMesh(*node.Mesh, world); err != nil {
+					return fmt.Errorf("node %d %q: %w", nodeIdx, node.Name, err)
+				}
+			}
+			for _, child := range node.Children {
+				if err := walk(child, depth+1, world); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, root := range roots {
+			if err := walk(root, 0, gltfIdentity); err != nil {
+				return Model3D{}, err
+			}
+		}
+	}
+
+	// Vertex normals are all-or-nothing: a renderer that finds fewer than
+	// one per vertex falls back to face normals for the whole model.
+	if len(model.VertexNormals) != len(model.Vertices) {
+		model.VertexNormals = nil
+	} else {
+		for i, n := range model.VertexNormals {
+			length := math.Sqrt(n.X*n.X + n.Y*n.Y + n.Z*n.Z)
+			if length < 1e-9 {
+				model.VertexNormals = nil
+				break
+			}
+			model.VertexNormals[i] = Vector3D{X: n.X / length, Y: n.Y / length, Z: n.Z / length}
 		}
 	}
 
@@ -517,4 +685,56 @@ func buildModelFromGLTF(doc *gltfJSON, buffers [][]byte, sourcePath string) (Mod
 	}
 
 	return model, nil
+}
+
+// validateGLTFNodeGraph checks every node's indices and local transform, and
+// rejects a child cycle or a hierarchy deeper than maxGLTFNodeDepth, so a
+// bad file is reported once with a clear message instead of failing while
+// it is being drawn.
+func validateGLTFNodeGraph(doc *gltfJSON) error {
+	for i, node := range doc.Nodes {
+		if _, err := gltfNodeTransform(node); err != nil {
+			return fmt.Errorf("node %d %q: %w", i, node.Name, err)
+		}
+		if node.Mesh != nil && (*node.Mesh < 0 || *node.Mesh >= len(doc.Meshes)) {
+			return fmt.Errorf("node %d %q: mesh index %d out of range (%d meshes)", i, node.Name, *node.Mesh, len(doc.Meshes))
+		}
+		for _, child := range node.Children {
+			if child < 0 || child >= len(doc.Nodes) {
+				return fmt.Errorf("node %d %q: child index %d out of range (%d nodes)", i, node.Name, child, len(doc.Nodes))
+			}
+		}
+	}
+
+	const (
+		onStack = iota + 1
+		done
+	)
+	state := make([]int, len(doc.Nodes))
+	var visit func(idx, depth int) error
+	visit = func(idx, depth int) error {
+		if depth > maxGLTFNodeDepth {
+			return fmt.Errorf("node hierarchy is deeper than %d nodes", maxGLTFNodeDepth)
+		}
+		switch state[idx] {
+		case onStack:
+			return fmt.Errorf("node %d %q is its own ancestor (cycle in the node graph)", idx, doc.Nodes[idx].Name)
+		case done:
+			return nil
+		}
+		state[idx] = onStack
+		for _, child := range doc.Nodes[idx].Children {
+			if err := visit(child, depth+1); err != nil {
+				return err
+			}
+		}
+		state[idx] = done
+		return nil
+	}
+	for i := range doc.Nodes {
+		if err := visit(i, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }

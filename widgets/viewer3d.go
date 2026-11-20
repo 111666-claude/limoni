@@ -667,6 +667,18 @@ func (v *Viewer3D) vertexShades(rotated []graphics.Vertex3D, light graphics.Ligh
 	for i := range normals {
 		normals[i] = graphics.Vector3D{}
 	}
+	// A model that carries its own vertex normals (glTF, and therefore every
+	// instance a node transform places) is lit by those, rotated into view
+	// space: averaging the faces again would round off the authored shading
+	// of a shared mesh and lose the sharp edges the file asked for.
+	if modelNormals := v.Model.VertexNormals; len(modelNormals) == n {
+		rotX, rotY := v.angles()
+		rot := newEulerRotation(rotX, rotY, v.RotZ)
+		for i, normal := range modelNormals {
+			shades[i] = light.CalculateIntensity(rot.applyVector(normal).Normalize())
+		}
+		return shades
+	}
 	for _, face := range v.Model.Faces {
 		if len(face) < 3 || !facesInRange(face, n) {
 			continue
@@ -742,6 +754,12 @@ func (r eulerRotation) apply(v graphics.Vertex3D) graphics.Vertex3D {
 	v = graphics.Vertex3D{X: v.X*r.cy + v.Z*r.sy, Y: v.Y, Z: -v.X*r.sy + v.Z*r.cy}
 	v = graphics.Vertex3D{X: v.X, Y: v.Y*r.cx - v.Z*r.sx, Z: v.Y*r.sx + v.Z*r.cx}
 	return graphics.Vertex3D{X: v.X*r.cz - v.Y*r.sz, Y: v.X*r.sz + v.Y*r.cz, Z: v.Z}
+}
+
+func (r eulerRotation) applyVector(v graphics.Vector3D) graphics.Vector3D {
+	v = graphics.Vector3D{X: v.X*r.cy + v.Z*r.sy, Y: v.Y, Z: -v.X*r.sy + v.Z*r.cy}
+	v = graphics.Vector3D{X: v.X, Y: v.Y*r.cx - v.Z*r.sx, Z: v.Y*r.sx + v.Z*r.cx}
+	return graphics.Vector3D{X: v.X*r.cz - v.Y*r.sz, Y: v.X*r.sz + v.Y*r.cz, Z: v.Z}
 }
 
 // clipSegment clips a segment to [0,maxX]×[0,maxY] (Liang–Barsky).

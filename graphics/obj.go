@@ -17,11 +17,15 @@ import (
 
 // Model3D is the geometry consumed by the wireframe/solid/textured renderer.
 type Model3D struct {
-	Name       string
-	Vertices   []Vertex3D
-	Faces      [][]int
-	FaceColors []cell.Color
-	FaceUVs    [][]int
+	Name     string
+	Vertices []Vertex3D
+	// VertexNormals, when present, holds one unit normal per vertex, in the
+	// same order as Vertices. glTF files carry them; the loaders that do not
+	// leave it nil and the renderers derive normals from the faces instead.
+	VertexNormals []Vector3D
+	Faces         [][]int
+	FaceColors    []cell.Color
+	FaceUVs       [][]int
 	// UVs are in image space: U grows right and V grows *down*, so (0,0) is
 	// the top-left texel. glTF already uses this origin; LoadOBJ flips the
 	// OpenGL-style V of an OBJ file on the way in.

@@ -58,6 +58,24 @@ Limoni natively parses popular 3D file formats:
 
 `Model3D.UVs` are in image space — V grows down, `(0,0)` is the top-left texel — as glTF has them; `LoadOBJ` flips OBJ's OpenGL-style V on the way in.
 
+### glTF scene nodes
+
+A `.glb`/`.gltf` file is more than a bag of meshes: it is a scene tree, and
+the same mesh may be mounted at several nodes. `LoadGLB` and `LoadGLTF`
+walk the selected scene's nodes, compose each node's `matrix` (column-major)
+or `translation`/`rotation`/`scale` with its parents', and bake the result
+into `Model3D.Vertices` — so a shared mesh is emitted once per node, at each
+node's place in the scene, and the renderers need to know nothing about
+glTF. Negative scales mirror a mesh's winding and are corrected; non-uniform
+scales transform normals by the inverse transpose. `NORMAL` accessors become
+`Model3D.VertexNormals` (nil when a primitive has none), and `Viewer3D`
+lights with them under Gouraud shading.
+
+A file with no node transforms loads exactly as before. A node cycle, a
+dangling node, mesh or scene index, a non-finite transform, a zero scale,
+or a hierarchy deeper than 256 nodes is an error, not a silently wrong
+picture.
+
 ### High-Level `Viewer3D` Widget
 Transform, illuminate, and render 3D models with a single declarative widget:
 

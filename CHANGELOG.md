@@ -8,6 +8,21 @@ a patch bump (`v0.x.y`) does not.
 
 ## [Unreleased]
 
+### Added
+
+- `graphics.LoadGLB` / `ParseGLB` place a mesh where the file's scene tree
+  puts it. Nodes' `matrix` or `translation`/`rotation`/`scale` are composed
+  down the hierarchy and baked into the vertices, so one mesh shared by two
+  nodes is drawn twice, at each node's position, instead of both copies at
+  the origin. Negative scales mirror the winding correctly, non-uniform
+  scales transform normals by the inverse transpose, and a file with no
+  transforms loads exactly as before. A child cycle, a dangling node, mesh
+  or scene index, a non-finite transform, a zero scale, and a hierarchy
+  deeper than 256 nodes are reported as errors rather than drawn.
+- `graphics.Model3D.VertexNormals` carries a model's own per-vertex normals
+  (glTF `NORMAL`); `Viewer3D` uses them for Gouraud shading when every
+  vertex has one, and derives normals from the faces otherwise.
+
 ### Breaking
 
 - `testkit.SnapshotDiff.Expected` and `.Actual` are `string`, not `rune`. A
